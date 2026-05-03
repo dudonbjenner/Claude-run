@@ -16,6 +16,7 @@ import time
 import argparse
 import logging
 from urllib.parse import urljoin, urlparse
+from urllib.robotparser import RobotFileParser
 from dataclasses import dataclass, fields, asdict
 from typing import Optional
 
@@ -84,18 +85,50 @@ class LeadScraper:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": user_agent})
 
+    # ── robots.txt cache ──────────────────────────────────────────────────────
+    _robots_cache: dict[str, RobotFileParser] = {}
+
+    def _robots(self, base: str) -> RobotFileParser:
+        if base not in self._robots_cache:
+            rp = RobotFileParser()
+            rp.set_url(base.rstrip("/") + "/robots.txt")
+            try:
+                rp.read()
+            except Exception:
+                pass  # treat as allow-all on fetch failure
+            self._robots_cache[base] = rp
+        return self._robots_cache[base]
+
+    def _allowed(self, url: str) -> bool:
+        parsed = urlparse(url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        return self._robots(base).can_fetch(self.session.headers["User-Agent"], url)
+
     # ── HTTP helpers ──────────────────────────────────────────────────────────
-    def _get(self, url: str) -> Optional[BeautifulSoup]:
-        try:
-            r = self.session.get(url, timeout=self.timeout)
-            r.raise_for_status()
-            return BeautifulSoup(r.text, "html.parser")
-        except requests.Timeout:
-            log.warning("  Timeout: %s", url)
-        except requests.HTTPError as e:
-            log.warning("  HTTP %s: %s", e.response.status_code, url)
-        except Exception as e:
-            log.warning("  Error fetching %s – %s", url, e)
+    def _get(self, url: str, retries: int = 3) -> Optional[BeautifulSoup]:
+        if not self._allowed(url):
+            log.info("  Blocked by robots.txt: %s", url)
+            return None
+        delay = 2.0
+        for attempt in range(1, retries + 1):
+            try:
+                r = self.session.get(url, timeout=self.timeout)
+                r.raise_for_status()
+                return BeautifulSoup(r.text, "html.parser")
+            except requests.Timeout:
+                log.warning("  Timeout (attempt %d/%d): %s", attempt, retries, url)
+            except requests.HTTPError as e:
+                code = e.response.status_code
+                # Don't retry client errors (4xx) except 429
+                if code != 429 and 400 <= code < 500:
+                    log.warning("  HTTP %s: %s", code, url)
+                    return None
+                log.warning("  HTTP %s (attempt %d/%d): %s", code, attempt, retries, url)
+            except Exception as e:
+                log.warning("  Error fetching %s – %s (attempt %d/%d)", url, e, attempt, retries)
+            if attempt < retries:
+                time.sleep(delay)
+                delay *= 2
         return None
 
     # ── Extraction helpers ────────────────────────────────────────────────────
