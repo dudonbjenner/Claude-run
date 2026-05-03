@@ -85,9 +85,7 @@ class LeadScraper:
         self.max_pages = max_pages_per_site
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": user_agent})
-
-    # ── robots.txt cache ──────────────────────────────────────────────────────
-    _robots_cache: dict[str, RobotFileParser] = {}
+        self._robots_cache: dict[str, RobotFileParser] = {}
 
     def _robots(self, base: str) -> RobotFileParser:
         if base not in self._robots_cache:
