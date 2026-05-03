@@ -196,5 +196,93 @@ class TestSaveCSV(unittest.TestCase):
         self.assertFalse(os.path.exists(path))
 
 
+class TestSitemapDiscovery(unittest.TestCase):
+    def setUp(self):
+        self.scraper = LeadScraper(delay=0, timeout=5)
+
+    def _mock_sitemap(self, urls: list[str]) -> str:
+        locs = "\n".join(f"  <url><loc>{u}</loc></url>" for u in urls)
+        return f"<?xml version='1.0'?><urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'>\n{locs}\n</urlset>"
+
+    def test_finds_contact_urls(self):
+        xml = self._mock_sitemap([
+            "https://example.com/",
+            "https://example.com/contact-us",
+            "https://example.com/about",
+            "https://example.com/products",
+        ])
+        resp = MagicMock()
+        resp.ok = True
+        resp.text = xml
+        with patch.object(self.scraper.session, "get", return_value=resp):
+            with patch.object(self.scraper, "_allowed", return_value=True):
+                result = self.scraper._sitemap_contact_urls("https://example.com")
+        self.assertIn("https://example.com/contact-us", result)
+        self.assertIn("https://example.com/about", result)
+        self.assertNotIn("https://example.com/products", result)
+
+    def test_skips_non_ok_response(self):
+        resp = MagicMock()
+        resp.ok = False
+        with patch.object(self.scraper.session, "get", return_value=resp):
+            with patch.object(self.scraper, "_allowed", return_value=True):
+                result = self.scraper._sitemap_contact_urls("https://example.com")
+        self.assertEqual(result, [])
+
+    def test_returns_at_most_five(self):
+        urls = [f"https://example.com/contact-{i}" for i in range(10)]
+        xml = self._mock_sitemap(urls)
+        resp = MagicMock()
+        resp.ok = True
+        resp.text = xml
+        with patch.object(self.scraper.session, "get", return_value=resp):
+            with patch.object(self.scraper, "_allowed", return_value=True):
+                result = self.scraper._sitemap_contact_urls("https://example.com")
+        self.assertLessEqual(len(result), 5)
+
+    def test_blocked_sitemap_skipped(self):
+        with patch.object(self.scraper, "_allowed", return_value=False):
+            result = self.scraper._sitemap_contact_urls("https://example.com")
+        self.assertEqual(result, [])
+
+
+class TestScrapeManyWorkers(unittest.TestCase):
+    def setUp(self):
+        self.scraper = LeadScraper(delay=0, timeout=5)
+
+    def _make_scrape(self):
+        def fake_scrape(url):
+            return Lead(url=url, company_name="Test", status="ok")
+        return fake_scrape
+
+    def test_single_worker_preserves_order(self):
+        urls = [f"https://site{i}.com" for i in range(5)]
+        with patch.object(self.scraper, "scrape", side_effect=self._make_scrape()):
+            results = self.scraper.scrape_many(urls, workers=1)
+        self.assertEqual([r.url for r in results], urls)
+
+    def test_multi_worker_returns_all(self):
+        urls = [f"https://site{i}.com" for i in range(10)]
+        with patch.object(self.scraper, "scrape", side_effect=self._make_scrape()):
+            results = self.scraper.scrape_many(urls, workers=4)
+        self.assertEqual(len(results), 10)
+        self.assertEqual({r.url for r in results}, set(urls))
+
+    def test_skips_blank_and_comment_lines(self):
+        urls = ["https://a.com", "", "# comment", "https://b.com"]
+        with patch.object(self.scraper, "scrape", side_effect=self._make_scrape()):
+            results = self.scraper.scrape_many(urls, workers=1)
+        self.assertEqual(len(results), 2)
+
+    def test_prepends_https_if_missing(self):
+        captured = []
+        def fake_scrape(url):
+            captured.append(url)
+            return Lead(url=url)
+        with patch.object(self.scraper, "scrape", side_effect=fake_scrape):
+            self.scraper.scrape_many(["example.com"], workers=1)
+        self.assertTrue(captured[0].startswith("https://"))
+
+
 if __name__ == "__main__":
     unittest.main()

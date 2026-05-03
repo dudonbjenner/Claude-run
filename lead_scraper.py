@@ -15,6 +15,7 @@ import csv
 import time
 import argparse
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 from dataclasses import dataclass, fields, asdict
@@ -191,6 +192,35 @@ class LeadScraper:
             return addr_tag.get_text(" ", strip=True)[:200]
         return ""
 
+    # ── Sitemap discovery ─────────────────────────────────────────────────────
+    _CONTACT_KEYWORDS = re.compile(
+        r"/(?:contact|about|team|reach|info|people|staff|support|help)",
+        re.IGNORECASE,
+    )
+
+    def _sitemap_contact_urls(self, base: str) -> list[str]:
+        """Return up to 5 contact-ish URLs found in the site's sitemap."""
+        found: list[str] = []
+        for sitemap_path in ("/sitemap.xml", "/sitemap_index.xml"):
+            sitemap_url = base.rstrip("/") + sitemap_path
+            if not self._allowed(sitemap_url):
+                continue
+            try:
+                r = self.session.get(sitemap_url, timeout=self.timeout)
+                if not r.ok:
+                    continue
+                soup = BeautifulSoup(r.text, "xml")
+                locs = [tag.get_text(strip=True) for tag in soup.find_all("loc")]
+                found += [
+                    loc for loc in locs
+                    if self._CONTACT_KEYWORDS.search(loc) and loc not in found
+                ]
+                if found:
+                    break
+            except Exception:
+                pass
+        return found[:5]
+
     # ── Per-site scraping ─────────────────────────────────────────────────────
     def scrape(self, url: str) -> Lead:
         lead = Lead(url=url)
@@ -200,7 +230,11 @@ class LeadScraper:
         all_phones: set[str] = set()
         socials: dict[str, str] = {}
 
-        urls_to_visit = [url] + [urljoin(base, p) for p in CONTACT_PATHS]
+        sitemap_urls = self._sitemap_contact_urls(base)
+        static_urls  = [urljoin(base, p) for p in CONTACT_PATHS]
+        # Sitemap hits first; static fallbacks fill gaps; homepage always first
+        extra = sitemap_urls + [u for u in static_urls if u not in sitemap_urls]
+        urls_to_visit = [url] + extra
         visited: set[str] = set()
         pages_scraped = 0
 
@@ -240,22 +274,38 @@ class LeadScraper:
         lead.instagram = socials.get("instagram", "")
         return lead
 
-    def scrape_many(self, urls: list[str]) -> list[Lead]:
-        results = []
-        for i, url in enumerate(urls, 1):
+    def scrape_many(self, urls: list[str], workers: int = 1) -> list[Lead]:
+        cleaned: list[str] = []
+        for url in urls:
             url = url.strip()
             if not url or url.startswith("#"):
                 continue
             if not url.startswith("http"):
                 url = "https://" + url
-            log.info("[%d/%d] Scraping %s", i, len(urls), url)
+            cleaned.append(url)
+
+        total = len(cleaned)
+
+        def _scrape_one(idx_url: tuple[int, str]) -> Lead:
+            i, url = idx_url
+            log.info("[%d/%d] Scraping %s", i, total, url)
             try:
-                lead = self.scrape(url)
+                return self.scrape(url)
             except Exception as e:
                 log.error("  Unhandled error for %s: %s", url, e)
-                lead = Lead(url=url, status="error")
-            results.append(lead)
-        return results
+                return Lead(url=url, status="error")
+
+        indexed = list(enumerate(cleaned, 1))
+
+        if workers <= 1:
+            return [_scrape_one(item) for item in indexed]
+
+        results: list[Optional[Lead]] = [None] * total
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_scrape_one, item): item[0] - 1 for item in indexed}
+            for future in as_completed(futures):
+                results[futures[future]] = future.result()
+        return [r for r in results if r is not None]
 
 
 # ── CSV export ────────────────────────────────────────────────────────────────
@@ -282,6 +332,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--delay",    type=float, default=1.5, help="Seconds between requests (default: 1.5)")
     p.add_argument("--timeout",  type=int,   default=10,  help="Request timeout in seconds (default: 10)")
     p.add_argument("--max-pages",type=int,   default=4,   help="Max pages crawled per site (default: 4)")
+    p.add_argument("--workers",  type=int,   default=1,   help="Parallel site workers (default: 1)")
     return p.parse_args()
 
 
@@ -300,7 +351,7 @@ def main() -> None:
         timeout=args.timeout,
         max_pages_per_site=args.max_pages,
     )
-    leads = scraper.scrape_many(urls)
+    leads = scraper.scrape_many(urls, workers=args.workers)
     save_csv(leads, args.output)
 
     # Summary
